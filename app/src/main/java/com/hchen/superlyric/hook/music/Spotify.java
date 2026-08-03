@@ -29,6 +29,7 @@ import android.os.HandlerThread;
 import android.os.SystemClock;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.hchen.hooktool.hook.AbsHook;
 import com.hchen.processor.HookThis;
@@ -39,11 +40,9 @@ import com.hchen.superlyric.hook.AbsPublisher;
 import com.hchen.superlyricapi.SuperLyricData;
 import com.hchen.superlyricapi.SuperLyricLine;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -57,6 +56,10 @@ import io.github.libxposed.api.XposedModuleInterface;
  * Hook 宿主系统媒体会话（MediaSession.setPlaybackState / setMetadata）拿到音轨标识
  * 与播放状态；hook 宿主网络栈（okhttp3.Headers）捕获会话头；调用 Spotify color-lyrics
  * 私有接口拉取歌词，按「位置插值 + Handler 轮询」推进当前行发布；音译放入翻译槽位。
+ * <p>
+ * 当前行与元数据通过不可变快照（{@link SongInfo} / {@link LyricData}）整体发布，
+ * 发送前校验歌词快照与歌曲快照的音轨标识一致——快速切歌时异步拉取与切歌不产生
+ * 歌词与元数据错配、无上一首残留。
  * <p>
  * 磁盘缓存命中不触发网络请求；404 视为无歌词（不发任何数据）；
  * 广告 / 无法解析音轨标识 → {@code sendStop()} 清空显示。
@@ -78,24 +81,51 @@ public final class Spotify extends AbsPublisher {
     private volatile long lastPositionUpdateTime = 0L;
     private volatile float speed = 0f;
 
-    // 音轨标识与元数据
-    private volatile String currentTrackId;
-    private volatile String currentTitle = "";
-    private volatile String currentArtist = "";
-    private final Map<String, TrackInfo> trackInfoCache = new ConcurrentHashMap<>();
-
-    // 歌词数据（apply 时整体替换）
-    private volatile List<SpotifyLine> lyricList = Collections.emptyList();
-    private volatile String lyricTrackId;
+    // 当前歌曲（不可变快照，整体发布）：trackId + title/artist 一次性原子可见
+    private volatile SongInfo currentSong;
+    // 歌词数据（不可变快照，整体发布）：切歌/无歌词时为 null
+    private volatile LyricData lyricData;
     private volatile int lastShownIndex = -1;
 
-    // 轮询推进
+    // 轮询推进：isRunning 防重入；loopToken 使重启后的旧轮询链立即失效，
+    // 避免 stopLoop→startLoop 时序下出现双链并行
     private volatile boolean isRunning = false;
+    private volatile long loopToken = 0L;
 
     // 异步拉取（缓存线程池：快速切歌时新请求不被慢的旧请求阻塞，
     // 过期结果由 applyLyrics 的 trackId 校验丢弃）
     private final ExecutorService downloadExecutor = Executors.newCachedThreadPool();
+    private final Map<String, TrackInfo> trackInfoCache = new ConcurrentHashMap<>();
     private final Set<String> downloadingIds = ConcurrentHashMap.newKeySet();
+
+    /** 歌曲上下文快照：音轨标识 + 标题/歌手，与歌词配对发布的元数据来源。 */
+    private static final class SongInfo {
+        @NonNull
+        final String trackId;
+        @NonNull
+        final String title;
+        @NonNull
+        final String artist;
+
+        SongInfo(@NonNull String trackId, @NonNull String title, @NonNull String artist) {
+            this.trackId = trackId;
+            this.title = title;
+            this.artist = artist;
+        }
+    }
+
+    /** 歌词快照：所属音轨标识 + 规整后的行列表（不可变）。 */
+    private static final class LyricData {
+        @NonNull
+        final String trackId;
+        @NonNull
+        final List<SpotifyLine> lines;
+
+        LyricData(@NonNull String trackId, @NonNull List<SpotifyLine> lines) {
+            this.trackId = trackId;
+            this.lines = lines;
+        }
+    }
 
     private static final class TrackInfo {
         final String id;
@@ -190,6 +220,7 @@ public final class Spotify extends AbsPublisher {
 
     private void onMetadataChanged(@NonNull MediaMetadata metadata) {
         String id = extractTrackId(metadata);
+        SongInfo song = currentSong;
         if (id == null) {
             // 广告 / 无法解析音轨标识 → sendStop 清空（Apple 范式）
             logD(TAG, "setMetadata: no valid track id, treat as ad/unknown, sendStop");
@@ -198,28 +229,27 @@ public final class Spotify extends AbsPublisher {
             return;
         }
 
-        if (id.equals(currentTrackId)) {
+        if (song != null && id.equals(song.trackId)) {
             logD(TAG, "setMetadata: same track, ignore: " + id);
             return;
         }
 
-        // 切歌：清空旧歌词与状态，避免残留上一首
+        // 切歌：立即清空旧歌词与显示，避免残留上一首
         sendStop();
         stopLoop();
-        lyricList = Collections.emptyList();
-        lyricTrackId = null;
+        lyricData = null;
         lastShownIndex = -1;
 
-        currentTrackId = id;
         TrackInfo info = trackInfoCache.computeIfAbsent(id, k -> {
             String title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE);
             String artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST);
             long duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION);
             return new TrackInfo(id, title, artist, duration);
         });
-        currentTitle = info.title != null ? info.title : "";
-        currentArtist = info.artist != null ? info.artist : "";
-        logD(TAG, "Track changed: id=" + id + ", title=" + currentTitle + ", artist=" + currentArtist);
+        String title = info.title != null ? info.title : "";
+        String artist = info.artist != null ? info.artist : "";
+        currentSong = new SongInfo(id, title, artist);
+        logD(TAG, "Track changed: id=" + id + ", title=" + title + ", artist=" + artist);
 
         fetchLyricsForTrack(id);
     }
@@ -228,6 +258,7 @@ public final class Spotify extends AbsPublisher {
      * 从 MEDIA_ID 剥 {@code spotify:track:} 前缀取音轨标识；
      * 无前缀 / 为空 → 非歌曲内容（广告），返回 null。
      */
+    @Nullable
     private String extractTrackId(@NonNull MediaMetadata metadata) {
         String mediaId = metadata.getString(MediaMetadata.METADATA_KEY_MEDIA_ID);
         if (mediaId == null) return null;
@@ -275,9 +306,11 @@ public final class Spotify extends AbsPublisher {
     }
 
     private void applyLyrics(@NonNull String id, @NonNull String json) {
-        // 竞态防护：异步拉取完成时校验当前音轨
-        if (!id.equals(currentTrackId)) {
-            logD(TAG, "Stale lyric response for " + id + ", current=" + currentTrackId + ", discard");
+        // 竞态防护：异步拉取完成时校验当前音轨（与当前歌曲快照比对）
+        SongInfo song = currentSong;
+        if (song == null || !id.equals(song.trackId)) {
+            logD(TAG, "Stale lyric response for " + id
+                + ", current=" + (song == null ? "null" : song.trackId) + ", discard");
             return;
         }
 
@@ -287,8 +320,7 @@ public final class Spotify extends AbsPublisher {
             return;
         }
 
-        lyricList = lines;
-        lyricTrackId = id;
+        lyricData = new LyricData(id, lines);
         lastShownIndex = -1;
         logD(TAG, "Lyrics ready for " + id + ", lines=" + lines.size() + ", first=" + lines.get(0).text);
 
@@ -302,41 +334,45 @@ public final class Spotify extends AbsPublisher {
     private synchronized void startLoop() {
         if (isRunning) return;
         isRunning = true;
-        lyricHandler.post(lyricLoop);
+        final long token = ++loopToken;
+        lyricHandler.post(() -> runLoop(token));
     }
 
     private synchronized void stopLoop() {
         isRunning = false;
     }
 
-    private final Runnable lyricLoop = new Runnable() {
-        @Override
-        public void run() {
-            if (!isRunning) return;
-            try {
-                if (playbackStateValue != PlaybackState.STATE_PLAYING) {
-                    isRunning = false;
-                    return;
-                }
-                if (lyricList.isEmpty() || !Objects.equals(lyricTrackId, currentTrackId)) {
-                    isRunning = false;
-                    return;
-                }
+    private void runLoop(long token) {
+        if (!isRunning || token != loopToken) return;
 
-                long estimated = estimatePosition();
-                int index = findLineIndex(estimated);
-                if (index >= 0 && index != lastShownIndex) {
-                    lastShownIndex = index;
-                    sendCurrentLine(lyricList.get(index));
-                }
-            } catch (Throwable t) {
-                logE(TAG, "Lyric loop error", t);
+        try {
+            if (playbackStateValue != PlaybackState.STATE_PLAYING) {
+                isRunning = false;
+                return;
             }
-            if (isRunning) {
-                lyricHandler.postDelayed(lyricLoop, LOOP_INTERVAL_MS);
+
+            // 同一轮迭代内取一致快照：歌词与歌曲上下文配对校验后再发送
+            LyricData data = lyricData;
+            SongInfo song = currentSong;
+            if (data == null || song == null || !data.trackId.equals(song.trackId)) {
+                isRunning = false;
+                return;
             }
+
+            long estimated = estimatePosition();
+            int index = findLineIndex(data.lines, estimated);
+            if (index >= 0 && index != lastShownIndex) {
+                lastShownIndex = index;
+                sendCurrentLine(data.lines.get(index), song);
+            }
+        } catch (Throwable t) {
+            logE(TAG, "Lyric loop error", t);
         }
-    };
+
+        if (isRunning && token == loopToken) {
+            lyricHandler.postDelayed(() -> runLoop(token), LOOP_INTERVAL_MS);
+        }
+    }
 
     /**
      * 位置插值：上次采样位置 + 速度 × 流逝时间。
@@ -349,8 +385,7 @@ public final class Spotify extends AbsPublisher {
     /**
      * 顺序查找 startTime ≤ 位置 < endTime 的行。
      */
-    private int findLineIndex(long position) {
-        List<SpotifyLine> lines = lyricList;
+    private int findLineIndex(@NonNull List<SpotifyLine> lines, long position) {
         for (int i = 0; i < lines.size(); i++) {
             SpotifyLine line = lines.get(i);
             if (position >= line.startTimeMs && position < line.endTimeMs) {
@@ -360,16 +395,16 @@ public final class Spotify extends AbsPublisher {
         return -1;
     }
 
-    private void sendCurrentLine(@NonNull SpotifyLine line) {
+    private void sendCurrentLine(@NonNull SpotifyLine line, @NonNull SongInfo song) {
         SuperLyricData data = new SuperLyricData()
-            .setTitle(currentTitle)
-            .setArtist(currentArtist)
+            .setTitle(song.title)
+            .setArtist(song.artist)
             .setLyric(new SuperLyricLine(line.text, line.startTimeMs, line.endTimeMs));
         if (line.transliteratedWords != null && !line.transliteratedWords.trim().isEmpty()) {
             data.setTranslation(new SuperLyricLine(line.transliteratedWords));
         }
         sendLyric(data);
-        logD(TAG, "sendLyric: [" + currentTitle + " - " + currentArtist + "] " + line.text);
+        logD(TAG, "sendLyric: [" + song.title + " - " + song.artist + "] " + line.text);
     }
 
     // ------------------------------ 会话头捕获 ------------------------------
